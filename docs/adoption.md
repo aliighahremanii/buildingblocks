@@ -10,6 +10,10 @@ boundaries and replay invariants, see the [architecture guide](architecture.md).
 
 ## 1. Add the dependency
 
+`v0.1.0` is not yet published (public-proxy verification returns HTTP 404).
+The command below requires completed publication; see the
+[publication status](../README.md) and [release procedure](release.md).
+
 ```bash
 go get github.com/aliighahremanii/buildingblocks@v0.1.0
 ```

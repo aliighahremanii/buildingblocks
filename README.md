@@ -10,8 +10,13 @@ pinned module dependency.
 - **Module path:** `github.com/aliighahremanii/buildingblocks`
 - **Go:** `1.26.3`
 - **License:** [Apache-2.0](LICENSE)
-- **Visibility:** public — fetched anonymously through the standard Go module
+- **Visibility:** public — consumed anonymously through the standard Go module
   proxy (see [Fetching](#fetching))
+
+**Publication status:** `v0.1.0` is not yet published; public-proxy
+verification returns HTTP 404. The versioned fetch commands below describe
+consumption after publication, not a currently available release. Local candidate
+verification does not establish public availability. See [Releasing](docs/release.md).
 
 ## What this is
 
