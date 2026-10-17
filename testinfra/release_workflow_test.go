@@ -1,7 +1,11 @@
 package testinfra
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -42,7 +46,7 @@ func jobNames(workflow string) []string {
 // permission model: the workflow default is `contents: read`, and the ONLY
 // job that may write is the publish job. A verification job that can push to
 // the repository is an unnecessary credential surface — and the fetchability
-// proof deliberately uses a read-only token.
+// proof consumes no token.
 func TestReleaseWorkflowIsReadOnlyExceptWhenPublishing(t *testing.T) {
 	t.Parallel()
 
@@ -102,7 +106,7 @@ func TestReleaseWorkflowCheckoutsNeverPersistCredentials(t *testing.T) {
 		}
 	}
 	if checkouts < 4 {
-		t.Errorf("release.yml should check out in every job (tag verify, module verify, integration, publish); found %d checkouts — parser drift?", checkouts)
+		t.Errorf("release.yml should check out in tag verify, module verify, integration, and publish; found %d checkouts — parser drift?", checkouts)
 	}
 }
 
@@ -148,7 +152,7 @@ func TestReleaseWorkflowProvesAnonymousPublicFetchWithChecksumVerification(t *te
 
 	// 2. The fetch step itself.
 	var fetchStep string
-	for _, step := range stepBlocks(wf) {
+	for _, step := range stepBlocks(jobBlock(t, wf, "verify-public-fetch")) {
 		if strings.Contains(step, "fetchable") {
 			fetchStep = step
 			break
@@ -362,9 +366,181 @@ func TestReleaseWorkflowWaitsForLiveIntegration(t *testing.T) {
 	if needs == nil {
 		t.Fatalf("release.yml publish job must declare `needs:` as an inline list; block:\n%s", release)
 	}
-	for _, required := range []string{"verify-tag", "verify-module", "integration"} {
-		if !strings.Contains(needs[1], required) {
+	dependencies := strings.Split(strings.ReplaceAll(needs[1], " ", ""), ",")
+	for _, required := range []string{"verify-tag", "verify-module", "integration", "verify-public-fetch"} {
+		if !slices.Contains(dependencies, required) {
 			t.Errorf("release.yml publish job must need %q before publishing; got needs: [%s]", required, needs[1])
+		}
+	}
+}
+
+func TestReleaseWorkflowPublicFetchWaitsForAllVerification(t *testing.T) {
+	t.Parallel()
+	wf := readRepoFile(t, ".github/workflows/release.yml")
+	fetch := stripComments(jobBlock(t, wf, "verify-public-fetch"))
+	needs := regexp.MustCompile(`(?m)^    needs:\s*\[(.+)\]`).FindStringSubmatch(fetch)
+	if needs == nil {
+		t.Fatalf("public fetch must declare its verification dependencies:\n%s", fetch)
+	}
+	dependencies := strings.Split(strings.ReplaceAll(needs[1], " ", ""), ",")
+	for _, required := range []string{"verify-tag", "verify-module", "integration"} {
+		if !slices.Contains(dependencies, required) {
+			t.Errorf("public fetch must wait for %s; got %v", required, dependencies)
+		}
+	}
+	if !strings.Contains(fetch, "cache: false") {
+		t.Error("public fetch must disable setup-go cache restoration")
+	}
+	for _, forbidden := range []string{"actions/checkout@", "secrets.", "continue-on-error:", "if:"} {
+		if strings.Contains(fetch, forbidden) {
+			t.Errorf("public fetch must not contain %q", forbidden)
+		}
+	}
+	for _, name := range []string{"verify-tag", "verify-module", "integration", "release"} {
+		job := stripComments(jobBlock(t, wf, name))
+		for _, forbidden := range []string{"go get", "proxy.golang.org", "continue-on-error:", "if:"} {
+			if strings.Contains(job, forbidden) {
+				t.Errorf("job %s must not bypass gates or perform the public fetch: %q", name, forbidden)
+			}
+		}
+	}
+}
+
+// releaseStepScript extracts a named step's literal shell body so failure-path
+// tests exercise the actual workflow rather than a copy of its logic.
+func releaseStepScript(t *testing.T, wf, job, name string) string {
+	t.Helper()
+	for _, step := range stepBlocks(jobBlock(t, wf, job)) {
+		if !strings.HasPrefix(step, "      - name: "+name+"\n") {
+			continue
+		}
+		_, body, ok := strings.Cut(step, "        run: |\n")
+		if !ok {
+			t.Fatalf("step %q has no literal run body", name)
+		}
+		var lines []string
+		for _, line := range strings.Split(body, "\n") {
+			if strings.TrimSpace(line) != "" && !strings.HasPrefix(line, "          ") {
+				t.Fatalf("unexpected run indentation in %q: %q", name, line)
+			}
+			lines = append(lines, strings.TrimPrefix(line, "          "))
+		}
+		return strings.Join(lines, "\n")
+	}
+	t.Fatalf("missing step %q in job %q", name, job)
+	return ""
+}
+
+func TestReleaseWorkflowUsesValidatedCuratedNotesFromTag(t *testing.T) {
+	t.Parallel()
+	wf := readRepoFile(t, ".github/workflows/release.yml")
+	release := stripComments(jobBlock(t, wf, "release"))
+	for _, required := range []string{
+		"ref: ${{ needs.verify-tag.outputs.tag }}",
+		`--notes-file "docs/releases/${TAG}.md"`,
+		"--verify-tag",
+	} {
+		if !strings.Contains(release, required) {
+			t.Errorf("publish job must contain %q", required)
+		}
+	}
+	if strings.Contains(stripComments(wf), "--generate-notes") {
+		t.Error("release must use curated notes, not generated notes")
+	}
+	module := jobBlock(t, wf, "verify-module")
+	if !strings.Contains(module, "TAG: ${{ needs.verify-tag.outputs.tag }}") {
+		t.Error("notes validation must use the validated tag")
+	}
+	script := releaseStepScript(t, wf, "verify-module", "Validate curated release notes")
+	for _, tc := range []struct {
+		name, notes string
+		wantOK      bool
+	}{
+		{name: "missing"},
+		{name: "empty", notes: ""},
+		{name: "wrong version", notes: "# v0.2.0\n\nOther notes.\n"},
+		{name: "partial heading", notes: "# v0.1.0-rc.1\n\nOther notes.\n"},
+		{name: "curated v0.1.0", notes: readRepoFile(t, "docs/releases/v0.1.0.md"), wantOK: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.name != "missing" {
+				notesDir := filepath.Join(dir, "docs", "releases")
+				if err := os.MkdirAll(notesDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(notesDir, "v0.1.0.md"), []byte(tc.notes), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("bash", "-e", "-o", "pipefail", "-c", script)
+			cmd.Dir = dir
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "TAG=v0.1.0"}
+			output, err := cmd.CombinedOutput()
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("notes validation error = %v, want success %t:\n%s", err, tc.wantOK, output)
+			}
+		})
+	}
+}
+
+func TestReleaseWorkflowExistenceChecksFailClosed(t *testing.T) {
+	t.Parallel()
+	wf := readRepoFile(t, ".github/workflows/release.yml")
+	for _, gate := range []struct{ job, step string }{
+		{"verify-tag", "Refuse to republish an existing release"},
+		{"release", "Create the release"},
+	} {
+		script := releaseStepScript(t, wf, gate.job, gate.step)
+		for _, tc := range []struct {
+			name, response, status string
+			wantOK                 bool
+		}{
+			{name: "empty repository", status: "0", wantOK: true},
+			{name: "other versions", response: "v0.1.0-rc.1\nv0.2.0", status: "0", wantOK: true},
+			{name: "already published or concurrent release", response: "v0.0.1\nv0.1.0\nv0.2.0", status: "0"},
+			{name: "large listing with early match", response: "v0.1.0\n" + strings.Repeat("v0.0.1\n", 10000), status: "0"},
+			{name: "API failure", status: "1"},
+			{name: "later page failure", response: "v0.0.1", status: "1"},
+		} {
+			t.Run(gate.job+"/"+tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				// Never invoke the real gh CLI: this shell function is the only
+				// API surface available to the workflow script in these tests.
+				stub := `
+gh() {
+  if [ "$1" = api ]; then
+    if [ "$#" -ne 5 ] || [ "$2" != --paginate ] || [ "$3" != repos/example/repo/releases ] || [ "$4" != --jq ] || [ "$5" != '.[].tag_name' ]; then
+      echo "unexpected API arguments: $*" >&2
+      return 2
+    fi
+    printf '%s\n' "${RESPONSE}"
+    return "${STATUS}"
+  fi
+  if [ "$1" = release ] && [ "$2" = create ]; then
+    printf '%s\n' "$@" > created
+    return 0
+  fi
+  echo "unexpected gh invocation: $*" >&2
+  return 2
+}
+`
+				cmd := exec.Command("bash", "-e", "-o", "pipefail", "-c", stub+script)
+				cmd.Dir = dir
+				cmd.Env = []string{
+					"PATH=" + os.Getenv("PATH"), "TAG=v0.1.0", "GITHUB_REPOSITORY=example/repo",
+					"RESPONSE=" + tc.response, "STATUS=" + tc.status,
+				}
+				output, err := cmd.CombinedOutput()
+				if (err == nil) != tc.wantOK {
+					t.Fatalf("existence check error = %v, want success %t:\n%s", err, tc.wantOK, output)
+				}
+				_, err = os.Stat(filepath.Join(dir, "created"))
+				wantCreate := tc.wantOK && gate.job == "release"
+				if (err == nil) != wantCreate {
+					t.Fatalf("release creation = %t, want %t", err == nil, wantCreate)
+				}
+			})
 		}
 	}
 }

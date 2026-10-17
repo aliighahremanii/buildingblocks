@@ -122,7 +122,13 @@ jobs:
           set -eu
           # Immutability gate: a published tag must never be re-released,
           # because consumers' go.sum entries already pin its hash.
-          if gh release view "${TAG}" >/dev/null 2>&1; then
+          # Only a successful, complete listing can establish absence. An API
+          # failure (including auth/rate-limit/network errors) is not absence.
+          if ! releases="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[].tag_name')"; then
+            echo "ERROR: could not establish whether release ${TAG} exists." >&2
+            exit 1
+          fi
+          if printf '%s\n' "${releases}" | grep -Fx -- "${TAG}" >/dev/null; then
             echo "ERROR: release ${TAG} already exists." >&2
             echo "Published module versions are IMMUTABLE: every consumer's go.sum pins" >&2
             echo "this version's hash, and the module proxy + checksum database cache it." >&2
@@ -177,6 +183,17 @@ jobs:
           fi
           echo "no replace/workspace directives"
 
+      - name: Validate curated release notes
+        env:
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          set -eu
+          notes="docs/releases/${TAG}.md"
+          if [ ! -s "${notes}" ] || ! grep -Fxq -- "# ${TAG}" "${notes}"; then
+            echo "ERROR: ${notes} must contain curated notes headed '# ${TAG}'." >&2
+            exit 1
+          fi
+
       - name: gofmt (must be clean)
         run: |
           set -eu
@@ -195,13 +212,25 @@ jobs:
 
       - name: Build, vet, test
         # Unit scope only: the datastore-backed suites auto-skip here and are
-        # run for real by the `integration` job, which `release` also needs.
-        # A green `release` therefore requires BOTH this job and the live one.
+        # run for real by the `integration` job. Both must pass before the
+        # public-fetch job can expose the tag to the public proxy.
         run: |
           set -eu
           go build ./...
           go vet ./...
           go test ./... -count=1 -timeout 300s
+
+  verify-public-fetch:
+    name: Verify anonymous public fetch after all local gates
+    needs: [verify-tag, verify-module, integration]
+    runs-on: ubuntu-latest
+    # No checkout or cache restore: only the anonymous consumer path is tested.
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: false
 
       - name: Prove the module is anonymously fetchable at this version
         run: |
@@ -215,7 +244,7 @@ jobs:
           # This step therefore has NO credential available and NO way for one
           # to satisfy the fetch:
           #   * no GITHUB_TOKEN / GH_TOKEN / Git auth header is exported into it
-          #     (the checkout above also sets `persist-credentials: false`);
+          #     (this job does not check out the repository);
           #   * GOPROXY names the public proxy ONLY — no `,direct` fallback — so
           #     Go never performs a Git fetch of this module at all: a checkout
           #     credential or an `http.extraheader` in this job's environment
@@ -380,7 +409,7 @@ jobs:
 
   release:
     name: Publish GitHub release
-    needs: [verify-tag, verify-module, integration]
+    needs: [verify-tag, verify-module, integration, verify-public-fetch]
     runs-on: ubuntu-latest
     # The ONLY job that may write: creating the release. Every other job (and
     # this job's own checkout) stays read-only.
@@ -390,6 +419,7 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.verify-tag.outputs.tag }}
           fetch-depth: 0
           # The release is created through the API with GH_TOKEN below; the
           # checkout never needs a push credential.
@@ -403,13 +433,17 @@ jobs:
           set -eu
           # Idempotency re-check: the verify job ran on a different runner, so
           # re-assert before mutating anything.
-          if gh release view "${TAG}" >/dev/null 2>&1; then
+          if ! releases="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[].tag_name')"; then
+            echo "ERROR: could not establish whether release ${TAG} exists." >&2
+            exit 1
+          fi
+          if printf '%s\n' "${releases}" | grep -Fx -- "${TAG}" >/dev/null; then
             echo "ERROR: release ${TAG} appeared concurrently; refusing to publish." >&2
             exit 1
           fi
           gh release create "${TAG}" \
             --title "${TAG}" \
-            --generate-notes \
+            --notes-file "docs/releases/${TAG}.md" \
             --verify-tag
           echo "published ${TAG}"
           echo "Consumers may now pin: require github.com/aliighahremanii/buildingblocks ${TAG}"

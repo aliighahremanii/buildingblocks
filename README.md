@@ -13,10 +13,11 @@ pinned module dependency.
 - **Visibility:** public — consumed anonymously through the standard Go module
   proxy (see [Fetching](#fetching))
 
-**Publication status:** `v0.1.0` is not yet published; public-proxy
-verification returns HTTP 404. The versioned fetch commands below describe
-consumption after publication, not a currently available release. Local candidate
-verification does not establish public availability. See [Releasing](docs/release.md).
+**Versioned consumption:** the `v0.1.0` commands below apply once that version
+has completed the [release procedure](docs/release.md). Check its
+[GitHub Release](https://github.com/aliighahremanii/buildingblocks/releases/tag/v0.1.0)
+and successful Release workflow before adopting it; these examples and local
+candidate verification do not establish publication or public availability.
 
 ## What this is
 
@@ -120,7 +121,8 @@ Resolution is the ordinary public path:
   substitute something else for it and invalidate the checksum guarantee; if
   you need a local override for development, keep it uncommitted and temporary.
 
-The release workflow proves the same path before publishing: a fresh module
+After tag, module, and live integration checks pass, the release workflow proves
+the same path before creating the GitHub Release: a fresh module
 resolves the tag anonymously through the public proxy and the public checksum
 database, with an empty private scope and a fresh module cache (see
 [`docs/release.md`](docs/release.md)).

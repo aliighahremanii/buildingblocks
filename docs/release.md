@@ -3,6 +3,11 @@
 Consumers pin this module by **exact version**. A published version is
 immutable — treat the steps below as a one-way operation.
 
+The `v0.1.0` commands in this repository are conditional examples, not a claim
+that the version is published. Confirm the version's GitHub Release and a
+successful Release workflow before adopting it. Local preparation and tests do
+not create a tag or release and do not prove public-proxy availability.
+
 ## Version scheme
 
 Annotated tags of the form `vMAJOR.MINOR.PATCH`, optionally with a pre-release
@@ -61,7 +66,11 @@ a human-error incident, not a guarded invariant.
    integration evidence.
 2. Confirm `go.mod` declares `module github.com/aliighahremanii/buildingblocks`
    and contains **no** `replace` directive, and that no `go.work` file exists.
-3. Update any version references in docs (`README.md` quick start).
+3. Review the curated notes in `docs/releases/<tag>.md` (for example,
+   [`docs/releases/v0.1.0.md`](releases/v0.1.0.md)) on the release commit. Each
+   version requires a non-empty notes file with an exact `# <tag>` heading;
+   the workflow does not generate notes. Update version examples in docs as
+   appropriate without claiming publication before the workflow completes.
 4. Create an **annotated** tag on the release commit:
 
    ```bash
@@ -72,14 +81,17 @@ a human-error incident, not a guarded invariant.
 5. The `Release` workflow then:
    - validates the tag shape (`vMAJOR.MINOR.PATCH`), annotation, and that the
      tagged commit is reachable from `main`;
-   - refuses to proceed if a GitHub release already exists for the tag;
+    - refuses to proceed if a GitHub release already exists for the tag, or if
+      the API cannot establish its absence from a complete release listing;
    - re-verifies the module at the tagged commit (module path, no
-     replace/workspace, gofmt, tidy, build, vet, unit tests);
+      replace/workspace, curated notes, gofmt, tidy, build, vet, unit tests);
    - runs the **datastore-backed suites for real** (`script/integration-test.sh`:
      live Postgres, KurrentDB, Meilisearch and NATS with
      `BUILDINGBLOCKS_REQUIRE_INTEGRATION=1`, so a skip fails) — a version is
      never published on unit coverage alone;
-   - proves the module is **fetchable at that version** the way a consumer
+    - only after tag, module, and live integration checks succeed, a separate
+      read-only `verify-public-fetch` job proves the module is **fetchable at
+      that version** the way a consumer
      fetches it: a fresh module resolves the tag **anonymously through the
      public module proxy** (`https://proxy.golang.org`, no `,direct` fallback)
      with the **public checksum database** (`sum.golang.org`) verifying the
@@ -88,15 +100,22 @@ a human-error incident, not a guarded invariant.
      ASKPASS, so neither a checkout credential nor a Git credential helper can
      satisfy the fetch, and `go.sum` must carry both `h1:` entries before the
      step passes;
-   - creates the GitHub release.
+    - only after that proof succeeds, re-checks release absence (API failures
+      block publication) and creates the GitHub Release using the curated notes
+      checked out from the validated tag, not from the dispatch branch.
 
-   Only after this succeeds is the version usable. A tag alone is not a release.
+   Only after this succeeds is the release procedure complete. A tag alone is
+   not a completed release, but a **public tag can already be discovered and
+   cached** by Go consumers before the workflow finishes. The dependency gates
+   delay this workflow's own proxy request; they cannot make tag visibility and
+   GitHub Release creation atomic. Treat a pushed version tag as immutable even
+   if a later gate fails. Never move, delete, or re-create it to repair a failure.
 
    **Permissions:** the workflow default is `contents: read`. Only the final
    publish job raises it to `contents: write`, for the single step that creates
    the release, and every checkout sets `persist-credentials: false`.
 
-6. Consumers may now pin:
+6. Once the workflow and GitHub Release are confirmed, consumers may pin:
 
    ```
    require github.com/aliighahremanii/buildingblocks v0.1.0
@@ -124,3 +143,10 @@ a human-error incident, not a guarded invariant.
 The workflow accepts `workflow_dispatch` with a `tag` input. That path still
 enforces the "no existing release" rule, so it can only ever complete a publish
 that never landed — it cannot overwrite one.
+
+If a transient service or proxy failure interrupted verification, retry the same
+unchanged annotated tag. If the tagged source or curated notes need correction,
+prepare a new version instead. If creation succeeded but the workflow result is
+uncertain, inspect the existing release; a retry refuses to overwrite it. API
+errors during either existence check fail closed, rather than authorizing a
+retry to publish blindly.
