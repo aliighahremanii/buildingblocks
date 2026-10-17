@@ -1,0 +1,415 @@
+# Tag-driven release for github.com/aliighahremanii/buildingblocks.
+#
+# Consumers pin this module by EXACT version (no `replace`, no workspace):
+#
+#     require github.com/aliighahremanii/buildingblocks v0.1.0
+#
+# so a published tag is a permanent, checksum-bearing contract. Go module
+# proxies and the public checksum database both cache the first version they
+# see for a (module, version) pair, and `go.sum` in every consumer pins the
+# resulting hash. Moving or re-creating a tag after publication therefore
+# produces a checksum mismatch in every consumer — which is why this workflow
+# refuses to publish over an existing release and why the repository MUST have
+# tag protection (a GitHub ruleset restricting `v*` tag creation/update/deletion
+# to the release actor) enabled as the actual immutability mechanism.
+# A workflow can only refuse to cooperate; the ruleset is what makes a moved
+# tag impossible. See docs/release.md.
+#
+# PERMISSIONS: the workflow default is `contents: read`. Only the final
+# publish job raises it to `contents: write`, and only for the single step
+# that creates the release. Every checkout sets `persist-credentials: false`,
+# so no job leaves a token in the checkout's `.git/config` — the verification
+# jobs never need to write anything back to the repository.
+#
+# PUBLIC-MODULE FETCH: this module is PUBLIC, so a consumer's `go get` resolves
+# it exactly like any other dependency: the standard public module proxy
+# (proxy.golang.org) serves the version and the public checksum database
+# (sum.golang.org) verifies its hash. No credential, no private scope, and no
+# direct-VCS fetch is involved anywhere — which is why the fetchability proof
+# below runs with an EMPTY private scope, an explicitly public GOPROXY (no
+# `,direct`), and a fresh module cache, so a checkout credential or a Git auth
+# header in the job's environment cannot satisfy the fetch. The step never sets
+# `GOSUMDB=off`, `GOPRIVATE`, `GONOPROXY`, `GONOSUMDB`, or `GOFLAGS=-mod=mod`
+# outside that one throwaway consumer module. See docs/release.md.
+#
+# Because the public proxy and checksum database both cache the FIRST version
+# they see for a (module, version) pair, publishing is one-way: a moved or
+# re-created tag produces a checksum mismatch in every consumer.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing annotated tag to release (for re-running a failed publish)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-tag:
+    name: Verify tag identity and immutability
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # Full history: the reachability and annotation checks below need the
+          # real tag object and the branch graph, not a shallow snapshot.
+          fetch-depth: 0
+          # Read-only job: never leave a credential in .git/config.
+          persist-credentials: false
+
+      - name: Resolve and validate the tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -eu
+          tag="${INPUT_TAG:-${GITHUB_REF#refs/tags/}}"
+          if [ -z "${tag}" ]; then
+            echo "ERROR: no tag resolved (event ${GITHUB_EVENT_NAME})." >&2
+            exit 1
+          fi
+
+          # 1. Semver shape. Pre-release/build suffixes are allowed after the
+          #    patch number; a bare "v1" or "v1.2" is NOT — Go module versions
+          #    must be vMAJOR.MINOR.PATCH.
+          if ! printf '%s' "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "ERROR: tag ${tag} is not a Go module version (want vMAJOR.MINOR.PATCH[-pre])." >&2
+            exit 1
+          fi
+
+          # 2. The tag must exist locally and be ANNOTATED. A lightweight tag
+          #    has no tagger/date, which makes provenance unauditable.
+          if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "ERROR: tag ${tag} does not exist in this checkout." >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -t "refs/tags/${tag}")" != "tag" ]; then
+            echo "ERROR: ${tag} is a LIGHTWEIGHT tag; create an annotated tag (git tag -a)." >&2
+            exit 1
+          fi
+
+          # 3. The tagged commit must be reachable from main. Releasing a commit
+          #    that never landed on main publishes unreviewed code.
+          if ! git merge-base --is-ancestor "refs/tags/${tag}^{commit}" origin/main; then
+            echo "ERROR: ${tag} does not point at a commit reachable from origin/main." >&2
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${tag#v}" >> "${GITHUB_OUTPUT}"
+          echo "validated ${tag} ($(git rev-parse "refs/tags/${tag}^{commit}"))"
+
+      - name: Refuse to republish an existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eu
+          # Immutability gate: a published tag must never be re-released,
+          # because consumers' go.sum entries already pin its hash.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "ERROR: release ${TAG} already exists." >&2
+            echo "Published module versions are IMMUTABLE: every consumer's go.sum pins" >&2
+            echo "this version's hash, and the module proxy + checksum database cache it." >&2
+            echo "Cut a NEW version instead (and never move or delete ${TAG})." >&2
+            exit 1
+          fi
+          echo "no existing release for ${TAG}"
+
+  verify-module:
+    name: Verify the module at the tagged commit
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-tag.outputs.tag }}
+          fetch-depth: 0
+          # Verification never writes back to the repository.
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+
+      - name: Module path must match the repository
+        run: |
+          set -eu
+          want="github.com/aliighahremanii/buildingblocks"
+          got="$(go list -m)"
+          if [ "${got}" != "${want}" ]; then
+            echo "ERROR: go.mod declares ${got}, expected ${want}" >&2
+            exit 1
+          fi
+
+      - name: No replace or workspace directives
+        run: |
+          set -eu
+          # A published library must resolve from its own module definition.
+          # `replace` would be ignored by consumers anyway (only the main
+          # module's replaces apply) and a go.work file would silently
+          # substitute local directories — both are release-blocking.
+          if grep -Eq '^[[:space:]]*replace[[:space:]]' go.mod; then
+            echo "ERROR: go.mod contains a replace directive." >&2
+            exit 1
+          fi
+          if [ -e go.work ] || [ -e go.work.sum ]; then
+            echo "ERROR: a Go workspace file is present." >&2
+            exit 1
+          fi
+          echo "no replace/workspace directives"
+
+      - name: gofmt (must be clean)
+        run: |
+          set -eu
+          unformatted="$(gofmt -l . || true)"
+          if [ -n "${unformatted}" ]; then
+            echo "ERROR: not gofmt-clean:" >&2
+            printf '%s\n' "${unformatted}" >&2
+            exit 1
+          fi
+
+      - name: go mod tidy (must be stable)
+        run: |
+          set -eu
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Build, vet, test
+        # Unit scope only: the datastore-backed suites auto-skip here and are
+        # run for real by the `integration` job, which `release` also needs.
+        # A green `release` therefore requires BOTH this job and the live one.
+        run: |
+          set -eu
+          go build ./...
+          go vet ./...
+          go test ./... -count=1 -timeout 300s
+
+      - name: Prove the module is anonymously fetchable at this version
+        run: |
+          set -eu
+          # The real consumer path for a PUBLIC module: a fresh module resolves
+          # the tag ANONYMOUSLY through the public module proxy, with the public
+          # checksum database verifying the version's hash. That is exactly what
+          # `go get` does for any consumer — no credential, no private scope, no
+          # `replace`, no workspace.
+          #
+          # This step therefore has NO credential available and NO way for one
+          # to satisfy the fetch:
+          #   * no GITHUB_TOKEN / GH_TOKEN / Git auth header is exported into it
+          #     (the checkout above also sets `persist-credentials: false`);
+          #   * GOPROXY names the public proxy ONLY — no `,direct` fallback — so
+          #     Go never performs a Git fetch of this module at all: a checkout
+          #     credential or an `http.extraheader` in this job's environment
+          #     cannot satisfy a fetch that does not use Git;
+          #   * the module cache, the build cache, GOPATH and HOME are FRESH
+          #     temporary directories, so nothing can be served from a
+          #     pre-populated cache, a `~/.netrc`, or a `~/.gitconfig`
+          #     credential helper;
+          #   * the private scope is asserted EMPTY and GOSUMDB is asserted to be
+          #     the public default BEFORE the fetch, so the resolution cannot be
+          #     silently exempted from checksum verification;
+          #   * GIT_TERMINAL_PROMPT=0 with a failing ASKPASS makes a credential
+          #     prompt an actionable error, never a hang.
+          #
+          # This catches a module that builds locally but is not publicly
+          # fetchable: an unpushed commit, a tag the proxy cannot serve, a
+          # missing/invalid go.sum hash, or a version that resolves through a
+          # local replacement.
+
+          version="${{ needs.verify-tag.outputs.version }}"
+          module="github.com/aliighahremanii/buildingblocks"
+
+          tmp="$(mktemp -d)"
+          export GOMODCACHE="${tmp}/modcache"
+          export GOCACHE="${tmp}/gocache"
+          export GOPATH="${tmp}/gopath"
+          export HOME="${tmp}/home"
+          mkdir -p "${GOMODCACHE}" "${GOCACHE}" "${GOPATH}" "${HOME}"
+
+          # PUBLIC resolution only, with checksum verification ON.
+          export GOPROXY="https://proxy.golang.org"
+          export GOSUMDB="sum.golang.org"
+          export GOFLAGS="-mod=mod"
+          export GOWORK=off
+          # Explicitly EMPTY private scope: no module may be exempted from the
+          # proxy or from the checksum database.
+          export GOPRIVATE=
+          export GONOPROXY=
+          export GONOSUMDB=
+          export GONOSUMCHECK=
+          export GOINSECURE=
+
+          # No credential material may be inherited or reachable: no token, no
+          # interactive prompt, no credential helper, no global/system Git
+          # config (HOME is a fresh directory, and the global config is pinned
+          # to /dev/null as well).
+          unset GITHUB_TOKEN GH_TOKEN GIT_ASKPASS SSH_ASKPASS
+          export GIT_TERMINAL_PROMPT=0
+          export GIT_ASKPASS=/bin/false
+          export GIT_CONFIG_GLOBAL=/dev/null
+          export GIT_CONFIG_SYSTEM=/dev/null
+
+          # Prove the resolution environment is the public, checksum-verified
+          # default BEFORE fetching: a private-module exemption, a disabled
+          # checksum database, or a workspace would make this proof vacuous.
+          for name in GOPRIVATE GONOPROXY GONOSUMDB; do
+            value="$(go env "${name}")"
+            if [ -n "${value}" ]; then
+              echo "ERROR: ${name}=${value} — a private-module exemption is active, so an anonymous public fetch is not what this step proved." >&2
+              exit 1
+            fi
+          done
+          for want in "GOSUMDB=sum.golang.org" "GOPROXY=https://proxy.golang.org" "GOWORK=off"; do
+            got="$(go env "${want%%=*}")"
+            if [ "${got}" != "${want#*=}" ]; then
+              echo "ERROR: go env ${want%%=*} is ${got}, expected ${want#*=}; public proxy resolution with checksum verification is the consumer contract." >&2
+              exit 1
+            fi
+          done
+
+          cd "${tmp}"
+          cat > go.mod <<EOF
+          module example.com/fetchcheck
+
+          go 1.26.3
+          EOF
+          cat > main.go <<'EOF'
+          package main
+
+          import _ "github.com/aliighahremanii/buildingblocks/domain/uid"
+
+          func main() {}
+          EOF
+
+          # Retry: a freshly pushed tag can take a moment to appear.
+          attempt=1
+          while :; do
+            if go get "${module}@v${version}"; then
+              break
+            fi
+            if [ "${attempt}" -ge 5 ]; then
+              echo "ERROR: the module is not anonymously fetchable at v${version}." >&2
+              exit 1
+            fi
+            echo "attempt ${attempt} failed; retrying in 15s..." >&2
+            sleep 15
+            attempt=$((attempt + 1))
+          done
+
+          # Checksum verification is the integrity record: go.sum must carry the
+          # h1 hashes the PUBLIC checksum database recorded for this exact
+          # version, and every downloaded module must re-hash correctly.
+          for want in "${module} v${version} h1:" "${module} v${version}/go.mod h1:"; do
+            if ! grep -F "${want}" go.sum >/dev/null; then
+              echo "ERROR: go.sum has no \"${want}\" entry — the version was not checksum-verified through the public checksum database." >&2
+              exit 1
+            fi
+          done
+          go mod verify
+
+          resolved="$(go list -m -f '{{.Version}}' "${module}")"
+          if [ "${resolved}" != "v${version}" ]; then
+            echo "ERROR: the consumer resolved ${resolved}, expected v${version}." >&2
+            exit 1
+          fi
+          if go list -m -f '{{if .Replace}}REPLACED{{end}}' "${module}" | grep -q REPLACED; then
+            echo "ERROR: the module resolved through a replace directive." >&2
+            exit 1
+          fi
+          # The module must come from the module cache the PUBLIC PROXY filled,
+          # never from a local directory (which is what a `replace` or a
+          # workspace would substitute).
+          dir="$(go list -m -f '{{.Dir}}' "${module}")"
+          case "${dir}" in
+            "${GOMODCACHE}"/*) ;;
+            *)
+              echo "ERROR: ${module} resolved to ${dir}, outside the fresh module cache ${GOMODCACHE}." >&2
+              exit 1
+              ;;
+          esac
+
+          go build ./...
+          echo "fetchable anonymously at v${version} (public proxy + checksum database, exact version, no replace/workspace)"
+
+  # The live gate: a published version must have actually been exercised
+  # against real datastores. Without this job a release could ship a module
+  # whose Postgres/KurrentDB/Meilisearch/NATS suites never ran (they auto-skip
+  # without services) — a skip is not a pass.
+  integration:
+    name: Integration at the tagged commit (live datastores)
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+
+      - name: Run the datastore-backed suites (a skip is a failure)
+        # Same entry point as CI: real services, real readiness, the shared
+        # migrations applied by golang-migrate, then `go test ./...` with
+        # BUILDINGBLOCKS_REQUIRE_INTEGRATION=1 at Go's default parallelism.
+        run: bash script/integration-test.sh
+
+  release:
+    name: Publish GitHub release
+    needs: [verify-tag, verify-module, integration]
+    runs-on: ubuntu-latest
+    # The ONLY job that may write: creating the release. Every other job (and
+    # this job's own checkout) stays read-only.
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # The release is created through the API with GH_TOKEN below; the
+          # checkout never needs a push credential.
+          persist-credentials: false
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          set -eu
+          # Idempotency re-check: the verify job ran on a different runner, so
+          # re-assert before mutating anything.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "ERROR: release ${TAG} appeared concurrently; refusing to publish." >&2
+            exit 1
+          fi
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --generate-notes \
+            --verify-tag
+          echo "published ${TAG}"
+          echo "Consumers may now pin: require github.com/aliighahremanii/buildingblocks ${TAG}"

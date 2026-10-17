@@ -1,0 +1,153 @@
+# Library CI for github.com/aliighahremanii/buildingblocks.
+#
+# Runs on GitHub-hosted runners against the PUBLIC dependency set only: the
+# module itself is the source of truth here, so no private-repository
+# credential is involved anywhere in this workflow.
+#
+# What is enforced:
+#   * `gofmt -l` is empty — a formatting drift fails the build;
+#   * `go build ./...` and `go vet ./...` are clean;
+#   * `go test ./...` passes in the `verify` job. The live/integration tests
+#     in this module auto-SKIP when their datastore env vars are unset, so
+#     that job reports unit coverage only — and it SAYS so rather than
+#     implying more: the verbose step is the record of which tests skipped.
+#   * the datastore-backed suites ACTUALLY RUN in the `integration` job,
+#     which provisions Postgres, KurrentDB, Meilisearch and NATS from
+#     docker-compose.integration.yml (public, pinned images) and runs
+#     script/integration-test.sh with BUILDINGBLOCKS_REQUIRE_INTEGRATION=1.
+#     That switch turns every environment-gated skip into a FAILURE, so a
+#     provisioning job cannot report green on a skip. `verify` alone is
+#     therefore NOT integration evidence — `integration` is.
+#   * `go.mod`/`go.sum` are tidy and stable (a non-empty `go mod tidy` diff
+#     fails the build).
+#
+# The module is consumed by exact version (see docs/release.md); every push to
+# main and every tag therefore has to leave the module in a fetchable,
+# checksum-stable state.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pin the toolchain: the module declares `go 1.26.3`, and a floating
+  # toolchain would make a formatting/vet change land as a surprise failure.
+  GOFLAGS: -mod=readonly
+
+jobs:
+  verify:
+    name: Build, vet, format, test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # No job in this workflow pushes; the checkout credential is not
+          # needed beyond the clone.
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+
+      - name: Verify module identity
+        run: |
+          set -eu
+          # The module path is a PUBLIC contract: consumers pin it, and a
+          # silent rename would break every one of them at fetch time.
+          want="github.com/aliighahremanii/buildingblocks"
+          got="$(go list -m)"
+          if [ "${got}" != "${want}" ]; then
+            echo "ERROR: go.mod declares module ${got}, expected ${want}" >&2
+            exit 1
+          fi
+          echo "module: ${got}"
+
+      - name: gofmt (must be clean)
+        run: |
+          set -eu
+          unformatted="$(gofmt -l . || true)"
+          if [ -n "${unformatted}" ]; then
+            echo "ERROR: these files are not gofmt-clean:" >&2
+            printf '%s\n' "${unformatted}" >&2
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+      - name: go mod tidy (must be stable)
+        run: |
+          set -eu
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "ERROR: go.mod/go.sum are not tidy — commit the result of 'go mod tidy'." >&2
+            exit 1
+          fi
+          echo "go.mod/go.sum: tidy"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (unit; datastore-backed tests auto-skip)
+        run: go test ./... -count=1 -timeout 300s
+
+      - name: Test (verbose skip inventory)
+        # Records exactly which tests skipped and why, so the unit-only scope
+        # of this job is visible evidence rather than an assumption.
+        run: |
+          set -eu
+          go test ./... -count=1 -v 2>&1 | tee /tmp/test-verbose.log
+          echo "--- skipped:"
+          grep -c -- '--- SKIP' /tmp/test-verbose.log || true
+
+  # The datastore-backed suites, against REAL services. Kept in a separate
+  # job so the fast unit gate is not serialized behind image pulls, and so the
+  # distinction between "unit green" and "integration green" stays visible in
+  # the pipeline.
+  #
+  # A skip here is a FAILURE: script/integration-test.sh exports
+  # BUILDINGBLOCKS_REQUIRE_INTEGRATION=1, and every environment-gated skip in
+  # this module consults infrastructure/testenv. A green run therefore proves
+  # the live suites ran — not that they were skipped because the datastores
+  # were missing.
+  integration:
+    name: Integration (live Postgres, KurrentDB, Meilisearch, NATS)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # This job never pushes; the checkout credential is not needed
+          # beyond the clone.
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+          cache: true
+
+      - name: Run the datastore-backed suites (a skip is a failure)
+        # Brings the stack up, waits for real readiness, applies the shared
+        # migrations with the real golang-migrate runner, runs `go test ./...`
+        # with integration REQUIRED at Go's default package parallelism, and
+        # tears the stack down again — including on failure.
+        run: bash script/integration-test.sh
